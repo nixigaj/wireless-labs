@@ -1,3 +1,4 @@
+#include "communication.h"
 #include "contiki.h"
 #include "dev/adxl345.h"
 #include "dev/button-sensor.h"
@@ -9,13 +10,16 @@
 #include <string.h>
 
 #define LED_INT_ONTIME CLOCK_SECOND / 2
-#define ACCM_READ_INTERVAL CLOCK_SECOND / 100
+#define ACCM_READ_INTERVAL CLOCK_SECOND / 10
 
-static process_event_t ledOff_event;
+static process_event_t button_event;
+static process_event_t accelerator_event;
+
 /*---------------------------------------------------------------------------*/
 PROCESS(accel_process, "Test Accel process");
-PROCESS(led_process, "LED handling process");
-AUTOSTART_PROCESSES(&accel_process, &led_process); 
+PROCESS(button_process, "Test Accel process");
+PROCESS(comm_process, "Test Accel process");
+AUTOSTART_PROCESSES(&comm_process, &accel_process, &button_process);
 
 /*---------------------------------------------------------------------------*/
 /* Callback function for received packets.
@@ -26,60 +30,65 @@ AUTOSTART_PROCESSES(&accel_process, &led_process);
 static void recv(const void *data, uint16_t len, const linkaddr_t *src,
                  const linkaddr_t *dest) {}
 
-/*---------------------------------------------------------------------------*/
-/* When posted an ledOff event, the LEDs will switch off after LED_INT_ONTIME.
-      static process_event_t ledOff_event;
-      ledOff_event = process_alloc_event();
-      process_post(&led_process, ledOff_event, NULL);
-*/
-static struct etimer ledETimer;
-PROCESS_THREAD(led_process, ev, data) {
-  PROCESS_BEGIN();
-  while (1) {
-    PROCESS_WAIT_EVENT_UNTIL(ev == ledOff_event);
-    etimer_set(&ledETimer, LED_INT_ONTIME);
-    PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&ledETimer));
-    leds_off(LEDS_RED + LEDS_GREEN);
-  }
-  PROCESS_END();
+inline static void send() {
+  NETSTACK_NETWORK.output(NULL);
 }
 
 /* Main process, setups  */
 
 static struct etimer et;
-
 PROCESS_THREAD(accel_process, ev, data) {
-  static char payload[] = "Intruder!";
-
   PROCESS_BEGIN();
-  int16_t x;
-
-  /* Register the event used for lighting up an LED when interrupt strikes. */
-  ledOff_event = process_alloc_event();
-
-  /* Initialize NullNet */
-  nullnet_buf = (uint8_t *)&payload;
-  nullnet_len = sizeof(payload);
-  nullnet_set_input_callback(recv);
-
-  /* Start and setup the accelerometer with default values, eg no interrupts
-   * enabled. */
+  static int16_t x = 0;
   accm_init();
 
   while (1) {
     etimer_set(&et, ACCM_READ_INTERVAL);
     PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&et));
-
     x = accm_read_axis(X_AXIS);
-    if (abs(x) > 150) {
-      nullnet_buf = (uint8_t *)&payload;
-      nullnet_len = sizeof(payload);
-      memcpy(nullnet_buf, &payload, sizeof(payload));
-      nullnet_len = sizeof(payload);
-      NETSTACK_NETWORK.output(NULL);
+    if (abs(x) > 200) {
+      process_post(&comm_process, accelerator_event, NULL);
     }
   }
   PROCESS_END();
 }
 
+PROCESS_THREAD(button_process, ev, data) {
+  PROCESS_BEGIN();
+  static payload_event_t payload;
+  payload.type = BUTTON;
+  SENSORS_ACTIVATE(button_sensor);
+
+  while (1) {
+    PROCESS_WAIT_EVENT_UNTIL(ev == sensors_event && data == &button_sensor);
+    payload.data.button.button_id = 1;
+    process_post(&comm_process, button_event, &payload);
+  }
+  PROCESS_END();
+}
+
+PROCESS_THREAD(comm_process, ev, data) {
+  static payload_event_t event;
+  PROCESS_BEGIN();
+  /* Initialize NullNet */
+  nullnet_buf = (uint8_t *)&event;
+  nullnet_len = sizeof(event);
+  nullnet_set_input_callback(recv);
+
+  while (1) {
+    PROCESS_WAIT_EVENT_UNTIL(ev == button_event || ev == accelerator_event);
+    if (ev == button_event) {
+      printf("button pressed;");
+      nullnet_len = sizeof(event.type) + sizeof(event.data.button);
+      memcpy(nullnet_buf, &data, nullnet_len);
+      send();
+    } else if (ev == accelerator_event) {
+      printf("accelerometer");
+      nullnet_len = sizeof(event.type) + sizeof(event.data.accel);
+      memcpy(nullnet_buf, &data, nullnet_len);
+      send();
+    }
+  }
+  PROCESS_END();
+}
 /*---------------------------------------------------------------------------*/
