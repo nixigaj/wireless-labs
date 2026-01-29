@@ -7,17 +7,20 @@
 #include <stdio.h>
 #include <sys/types.h>
 
-#define INTRUDER_TIMEOUT CLOCK_SECOND * 2
-
+#define ALARM_TIMEOUT CLOCK_SECOND * 2
+#define BUTTON_TIMEOUT CLOCK_SECOND
+#define ACCEL_TIMEOUT CLOCK_SECOND
 #define BUTTON_LED 0b0001
 #define ACCEL_LED 0b0010
+#define ALL_LEDS 0b1111
 
 /* Declare our "main" process, the basestation_process */
 PROCESS(basestation_process, "Intruder basestation");
-PROCESS(led_process, "LED handling process");
+PROCESS(timer_process, "Timer handling process");
+PROCESS(event_process, "Event handling process");
 /* The basestation process should be started automatically when
  * the node has booted. */
-AUTOSTART_PROCESSES(&basestation_process, &led_process);
+AUTOSTART_PROCESSES(&basestation_process, &event_process, &timer_process);
 
 /* Callback function for received packets.
  *
@@ -25,124 +28,163 @@ AUTOSTART_PROCESSES(&basestation_process, &led_process);
  * this function will be called.
  */
 /*static void timeout_reached_cb(void *ptr) { leds_off(0b1110); }*/
-static struct etimer timer;
+
+typedef enum {
+  STATE_INACTIVE,
+  STATE_BUTTON,
+  STATE_ACCEL,
+  STATE_ALARM,
+  STATE_NONE
+} state_id_t;
+
+typedef enum {
+  EV_BUTTON_PRESSED,
+  EV_ACCEL_DETECTED,
+  EV_BUTTON_TIMER_EXPIRED,
+  EV_ACCEL_TIMER_EXPIRED,
+  EV_ALARM_TIMER_EXPIRED
+} state_event_t;
+
+static state_id_t previous_state = STATE_INACTIVE;
+static state_id_t current_state = STATE_INACTIVE;
+static struct etimer alarm_timer;
 static struct etimer button_timer;
 static struct etimer accel_timer;
 
-static bool button_active = false;
-static bool accel_active = false;
-enum station_event_t {
-  button_pressed,
-  accel_detected,
-  button_timer_expired,
-  accel_timer_expired,
-  alarm_timer_expired,
-};
+typedef void (*action_fn_t)(void);
+typedef struct {
+  state_id_t next_state;
+  action_fn_t actions[5]; // MUST END WITH NULL
+} transition;
+/* typedef struct State { */
+/*   uint8_t id; */
+/*   fn_t Enter; */
+/*   fn_t Exit; */
+/* } state_t; */
 
-typedef void (*fn_t)(void);
-typedef struct State {
-  uint8_t id;
-  fn_t Enter;
-  fn_t Do;
-  fn_t Exit;
-} state_t;
+static void set_alarm_timer() { etimer_set(&alarm_timer, ALARM_TIMEOUT); }
+static void try_set_alarm_timer() {
+  if (!etimer_expired(&button_timer) && !etimer_expired(&accel_timer))
+    etimer_set(&alarm_timer, ALARM_TIMEOUT);
+}
+static void set_button_timer() { etimer_set(&button_timer, BUTTON_TIMEOUT); }
+static void set_accel_timer() { etimer_set(&accel_timer, ACCEL_TIMEOUT); }
+static void turn_off_leds() { leds_off(ALL_LEDS); }
+static void turn_on_alarm_leds() { leds_on(ALL_LEDS); }
+static void turn_on_button_leds() { leds_on(BUTTON_LED); }
+static void turn_on_accel_leds() { leds_on(ACCEL_LED); }
 
-static void alarm_enter() {}
-static void alarm_do() {}
-static void alarm_exit() {}
-
-static void button_enter() {}
-static void button_do() {}
-static void button_exit() {}
-
-static void accel_enter() {}
-static void accel_do() {}
-static void accel_exit() {}
-
-static state_t alarm = {0, alarm_enter, alarm_do, alarm_exit};
-static state_t button = {1, button_enter, button_do, button_exit};
-static state_t accel = {2, accel_enter, accel_do, accel_exit};
-
-static void recv(const void *data, uint16_t len, const linkaddr_t *src,
-                 const linkaddr_t *dest) {
-  static payload_event_t *payload;
-  *payload = *(payload_event_t *)data;
-  switch (payload->type) {
-  case button_pressed:
-    process_post(&led_process, button_pressed, &payload);
-    break;
-  case accel_detected:
-    process_post(&led_process, accel_detected, &payload);
-    break;
-  default:
-    printf("received invalid event.");
-    break;
+// NOTE: assuming alarm timer is longer or equal to button and accel timers
+static void handle_alarm_timer_expired() {
+  turn_off_leds();
+  if (!etimer_expired(&button_timer)) {
+    turn_on_button_leds();
+    current_state = STATE_BUTTON;
+  } else if (!etimer_expired(&accel_timer)) {
+    turn_on_accel_leds();
+    current_state = STATE_ACCEL;
+  } else {
+    current_state = STATE_INACTIVE;
   }
 }
 
+
+transition transition_table[4][5] = {
+    //   EV_BUTTON_PRESSED,  EV_ACCEL_DETECTED,  EV_BUTTON_TIMER_EXPIRED,
+    //   EV_ACCEL_TIMER_EXPIRED,  EV_ALARM_TIMER_EXPIRED
+    /*INACTIVE*/ {
+        {STATE_BUTTON, {set_button_timer, turn_on_button_leds, NULL}},
+        {STATE_ACCEL, {set_accel_timer, turn_on_accel_leds, NULL}},
+        {STATE_NONE, {NULL}},
+        {STATE_NONE, {NULL}},
+        {STATE_NONE, {NULL}},
+    },
+    /*BUTTON*/
+    {
+        {STATE_BUTTON, {set_button_timer, NULL}},
+        {STATE_ALARM, {set_alarm_timer, turn_on_alarm_leds, NULL}},
+        {STATE_INACTIVE, {turn_off_leds, NULL}},
+        {STATE_NONE, {NULL}},
+        {STATE_NONE, {NULL}},
+    },
+    /*ACCEL*/
+    {
+        {STATE_ALARM, {set_alarm_timer, turn_on_alarm_leds, NULL}},
+        {STATE_ACCEL, {set_accel_timer, NULL}},
+        {STATE_NONE, {NULL}},
+        {STATE_INACTIVE, {turn_off_leds, NULL}},
+        {STATE_NONE, {NULL}},
+    },
+    /*ALARM*/
+    {
+        {STATE_ALARM, {set_button_timer, try_set_alarm_timer, NULL}},
+        {STATE_ALARM, {set_accel_timer, try_set_alarm_timer, NULL}},
+        {STATE_ALARM, {NULL}},
+        {STATE_ALARM, {NULL}},
+        {STATE_ALARM, {handle_alarm_timer_expired, NULL}},
+    },
+};
+
+static void apply_actions(action_fn_t *actions) {
+  while (*actions) {
+    (*actions++)();
+  }
+}
+static void transfer_state(state_event_t evt) {
+  previous_state = current_state;
+  current_state = transition_table[previous_state][evt].next_state;
+  apply_actions(transition_table[previous_state][evt].actions);
+}
+
+static void recv(const void *data, uint16_t len, const linkaddr_t *src,
+                 const linkaddr_t *dest) {
+  static state_event_t local_event;
+  static payload_event_t payload;
+  payload = *(payload_event_t *)data;
+  switch (payload.type) {
+  case BUTTON:
+    local_event = EV_BUTTON_PRESSED;
+    break;
+  case ACCEL:
+    local_event = EV_ACCEL_DETECTED;
+    break;
+  default:
+    printf("received invalid event.");
+    return;
+    break;
+  }
+  process_post(&event_process, local_event, NULL);
+}
+
 PROCESS_THREAD(timer_process, ev, data) {
-  static station_event_t event;
-  PROCESS_START();
+  PROCESS_BEGIN();
+  static state_event_t local_event;
   while (1) {
     PROCESS_WAIT_EVENT_UNTIL(PROCESS_EVENT_TIMER);
-    switch (data) {
-    case &button_timer:
-      event = button_timer_expired;
-      break;
-    case &accel_timer:
-      event = accel_timer_expired;
-      break;
-    case &timer:
-      break;
-    default:
+    if (data == &button_timer) {
+      local_event = EV_BUTTON_TIMER_EXPIRED;
+    } else if (data == &accel_timer) {
+      local_event = EV_ACCEL_TIMER_EXPIRED;
+    } else if (data == &alarm_timer) {
+      local_event = EV_ALARM_TIMER_EXPIRED;
+    } else {
       printf("invalid timer fired.");
       continue;
-      break;
     }
-    process_post(led_process, event, data);
+    process_post(&event_process, local_event, NULL);
   }
 
   PROCESS_END();
 }
 
-PROCESS_THREAD(led_process, ev, data) {
+PROCESS_THREAD(event_process, ev, data) {
   PROCESS_BEGIN();
-  static payload_event_t *payload;
-
   while (1) {
-    PROCESS_WAIT_EVENT_UNTIL(ev == button_pressed || ev == accel_detected ||
-                             ev == button_timer_expired ||
-                             ev == accel_timer_expired ||
-                             ev == alarm_timer_expired);
-    if (ev == PROCESS_EVENT_POLL) {
-      *payload = *(payload_event_t *)data;
-      switch (payload->type) {
-      case BUTTON:
-        button_active = true;
-        leds_on(BUTTON_LED);
-        break;
-      case ACCEL:
-        accel_active = true;
-        break;
-      default:
-        printf("received invalid event type.\n");
-        break;
-      }
-      if (button_active && accel_active) {
-        etimer_set(&timer, INTRUDER_TIMEOUT);
-        etimer_set(&button_timer, INTRUDER_TIMEOUT);
-        etimer_set(&button_timer, INTRUDER_TIMEOUT);
-      }
-      leds_on(0b1111);
-    } else if (etimer_expired(&timer)) {
-      leds_off(0b1111);
-    } else if (etimer_expired(&button_timer)) {
-      button_active = false;
-      leds_off(BUTTON_LED);
-    } else if (etimer_expired(&accel_timer)) {
-      accel_active = false;
-      leds_off(ACCEL_LED);
-    }
+    PROCESS_WAIT_EVENT_UNTIL(
+        ev == EV_BUTTON_PRESSED || ev == EV_ACCEL_DETECTED ||
+        ev == EV_BUTTON_TIMER_EXPIRED || ev == EV_ACCEL_TIMER_EXPIRED ||
+        ev == EV_ALARM_TIMER_EXPIRED);
+    transfer_state((state_event_t)ev);
   }
   PROCESS_END();
 }
