@@ -6,22 +6,22 @@ typedef enum EventType {
   ACCEL = 1,
 } event_type_t;
 
-typedef enum AccelAxis {
-  X = 0,
-  Y = 1,
-  Z = 2,
-} accel_axis_t;
+/* typedef enum AccelAxis { */
+/*   X = 0, */
+/*   Y = 1, */
+/*   Z = 2, */
+/* } accel_axis_t; */
 
-typedef struct PayloadEvent {
+typedef struct __attribute__((packed)) PayloadEvent {
   event_type_t type;
-  union {
-    struct {
-      int button_id;
-    } button;
+  /* union { */
+  /*   struct { */
+  /*     int button_id; */
+  /*   } button; */
 
-    struct {
-      accel_axis_t axis;
-      float value;
-    } accel;
-  } data;
+  /*   struct { */
+  /*     accel_axis_t axis; */
+  /*     uint16_t value; */
+  /*   } accel; */
+  /* } data; */
 } payload_event_t;
